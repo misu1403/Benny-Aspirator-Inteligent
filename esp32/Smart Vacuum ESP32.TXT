@@ -1,1 +1,220 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Motoare
+#define IN1 26
+#define IN2 27
+#define ENA 25
+#define IN3 33
+#define IN4 32
+#define ENB 14
+
+// Senzori ultrasonici
+#define TRIG_F 5
+#define ECHO_F 18
+#define TRIG_L 21
+#define ECHO_L 19
+#define TRIG_R 22
+#define ECHO_R 23
+
+// WiFi & Supabase
+const char* ssid = ""; //adresa wifi
+const char* password = ""; //parola wifi
+
+const String controlUrl = "https://buymgnmllcxtzuigqfse.supabase.co/rest/v1/robot_control?select=command,manual_control,user_id&order=created_at.desc.nullslast&limit=1";
+const String mapUrl = "https://buymgnmllcxtzuigqfse.supabase.co/rest/v1/map_data";
+const String logsUrl = "https://buymgnmllcxtzuigqfse.supabase.co/rest/v1/robot_logs";
+const String apiKey = ""; // chei api
+const String userId = "";
+
+long lastLoggedDistance = -1;
+unsigned long lastSensorCheck = 0;
+const int sensorInterval = 50;
+
+int x = 0, y = 0;
+char facing = 'N';
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300); Serial.print(".");
+  }
+  Serial.println("\n WiFi conectat!");
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(controlUrl);
+    http.addHeader("apikey", apiKey);
+    http.addHeader("Authorization", "Bearer " + apiKey);
+
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload);
+
+      if (doc.size() > 0) {
+        String command = doc[0]["command"];
+        bool manual = doc[0]["manual_control"];
+        if (manual) {
+          executeCommand(command);
+        } else {
+          runAutopilot();
+        }
+      }
+    }
+    http.end();
+  }
+  delay(30);
+}
+
+void runAutopilot() {
+  if (millis() - lastSensorCheck >= sensorInterval) {
+    long front = readDistanceCM(TRIG_F, ECHO_F);
+    long left  = readDistanceCM(TRIG_L, ECHO_L);
+    long right = readDistanceCM(TRIG_R, ECHO_R);
+    lastSensorCheck = millis();
+
+    Serial.print("AUTO F:"); Serial.print(front);
+    Serial.print("L:"); Serial.print(left);
+    Serial.print("R:"); Serial.println(right);
+
+    executeCommand("forward");
+    delay(300);
+    updatePosition();
+    Serial.println("Trimitem poziția robotului...");
+    logMapData("robot", "");
+
+    if (front < 10) {
+      executeCommand("backward"); delay(300);
+      rotateLeft(500); stopMotors(); delay(100);
+      return;
+    }
+
+    if (front < 15) {
+      avoidObstacle(left, right);
+      return;
+    }
+
+    if (front < 20) logMapData("wall", "front");
+    if (left < 20)  logMapData("wall", "left");
+    if (right < 20) logMapData("wall", "right");
+
+    if (abs(front - lastLoggedDistance) > 0) {
+      Serial.println("Logare distanță nouă...");
+      lastLoggedDistance = front;
+      logEvent("distance", String(front), "front");
+    }
+  }
+}
+
+void logMapData(String type, String dir) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(mapUrl);
+  http.addHeader("apikey", apiKey);
+  http.addHeader("Authorization", "Bearer " + apiKey);
+  http.addHeader("Content-Type", "application/json");
+
+  String body = "{";
+  body += "\"user_id\":\"" + userId + "\",";
+  body += "\"x\":" + String(x) + ",\"y\":" + String(y) + ",";
+  body += "\"type\":\"" + type + "\"";
+  if (dir != "") body += ",\"direction\":\"" + dir + "\"";
+  body += "}";
+
+  int code = http.POST(body);
+  Serial.print("Map Update: ");
+  Serial.print(code);
+  Serial.print("Body: ");
+  Serial.println(body);
+
+  http.end();
+}
+
+void logEvent(String event, String value, String source) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(logsUrl);
+  http.addHeader("apikey", apiKey);
+  http.addHeader("Authorization", "Bearer " + apiKey);
+  http.addHeader("Content-Type", "application/json");
+
+  String body = "{";
+  body += "\"event\":\"" + event + "\",";
+  body += "\"value\":\"" + value + "\",";
+  body += "\"source\":\"" + source + "\",";
+  body += "\"user_id\":\"" + userId + "\"";
+  body += "}";
+
+  int code = http.POST(body);
+  Serial.print("LogEvent: ");
+  Serial.print(code);
+  Serial.print("Body: ");
+  Serial.println(body);
+
+  http.end();
+}
+
+void avoidObstacle(long left, long right) {
+  executeCommand("backward"); delay(300); stopMotors(); delay(100);
+  if (left > right) executeCommand("left");
+  else executeCommand("right");
+  delay(300); stopMotors();
+}
+
+void updatePosition() {
+  if (facing == 'N') y++;
+  else if (facing == 'E') x++;
+  else if (facing == 'S') y--;
+  else if (facing == 'W') x--;
+}
+
+void rotateLeft(int duration) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, 130);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, 130);
+  delay(duration); stopMotors();
+  if (facing == 'N') facing = 'W';
+  else if (facing == 'W') facing = 'S';
+  else if (facing == 'S') facing = 'E';
+  else if (facing == 'E') facing = 'N';
+}
+
+void executeCommand(String cmd) {
+  if (cmd == "forward") {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, 130);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, 130);
+  } else if (cmd == "backward") {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, 130);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, 130);
+  } else if (cmd == "left") rotateLeft(300);
+  else if (cmd == "right") { rotateLeft(900); rotateLeft(900); rotateLeft(900); }
+  else stopMotors();
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+long readDistanceCM(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 10000);
+  if (duration == 0) return 999;
+  long distance = duration * 0.034 / 2;
+  if (distance < 2 || distance > 250) return 999;
+  return distance;
+}
 
